@@ -2,7 +2,7 @@
 
 A premium, glassmorphic dark-mode web application to discover local Chromecast devices and cast streaming media URLs (e.g. HLS feeds, Dash feeds, direct video links) using a local macOS process pipeline combining `yt-dlp` and `VLC`.
 
-![Live Cast Dashboard](public/index.html) *Note: Run the app to view the live dashboard in your browser.*
+![Live Cast Dashboard](screenshot.png)
 
 ---
 
