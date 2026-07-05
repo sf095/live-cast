@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Live Cast - Stream to Chromecast</title>
+  <meta name="description" content="Cast streaming URLs and HLS feeds directly to local Chromecasts with custom header control">
+  <link rel="stylesheet" href="css/style.css">
+  <!-- Lucide icons from CDN -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body>
+
+  <header>
+    <div class="logo-container">
+      <div class="logo-icon">
+        <i data-lucide="tv-2"></i>
+      </div>
+      <div>
+        <h1>LIVE CAST</h1>
+      </div>
+    </div>
+
+    <div class="sys-deps" id="sys-deps">
+      <div class="dep-badge" id="dep-ytdlp" title="yt-dlp command line tool">
+        <span class="status-dot"></span>
+        <span>yt-dlp</span>
+      </div>
+      <div class="dep-badge" id="dep-catt" title="catt command line tool">
+        <span class="status-dot"></span>
+        <span>catt</span>
+      </div>
+      <div class="dep-badge" id="dep-vlc" title="VLC App in Applications folder">
+        <span class="status-dot"></span>
+        <span>VLC Player</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="dashboard">
+    <!-- Left Column: Controller -->
+    <section class="glass-card">
+      <h2><i data-lucide="sliders"></i> Caster Controls</h2>
+
+      <form id="cast-form" onsubmit="return false;">
+        <!-- Device Selection -->
+        <div class="form-group">
+          <label for="device-select">Chromecast Device</label>
+          <div class="device-select-container">
+            <select id="device-select" required>
+              <option value="" disabled selected>Select a device...</option>
+            </select>
+            <button type="button" class="btn btn-secondary-sm btn-scan" id="btn-scan">
+              <i data-lucide="refresh-cw" id="scan-icon"></i> Scan Devices
+            </button>
+          </div>
+        </div>
+
+        <!-- URL Input -->
+        <div class="form-group mt-1">
+          <label for="stream-url">Stream URL (HLS/Dash/Direct Video)</label>
+          <input type="url" id="stream-url" placeholder="https://example.com/stream.m3u8" required>
+        </div>
+
+        <!-- Custom Headers Manager -->
+        <div class="form-group mt-1">
+          <div class="headers-manager">
+            <div class="headers-title-row">
+              <label><i data-lucide="headers"></i> Custom HTTP Headers</label>
+              <button type="button" class="btn-secondary-sm" id="btn-add-header">
+                <i data-lucide="plus" class="icon-sm"></i> Add Header
+              </button>
+            </div>
+            <div class="headers-list" id="headers-list">
+              <!-- Header rows dynamically added -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Save checkbox -->
+        <div class="form-group checkbox-row">
+          <input type="checkbox" id="save-preset-checkbox" class="mr-025 w-auto">
+          <label for="save-preset-checkbox" class="cursor-pointer select-none">Save to history presets</label>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="btn-container">
+          <button type="submit" class="btn btn-cast" id="btn-cast">
+            <i data-lucide="play-circle"></i> Start Cast
+          </button>
+          <button type="button" class="btn btn-stop" id="btn-stop" disabled>
+            <i data-lucide="stop-circle"></i> Stop Cast
+          </button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Right Column: Status & Presets -->
+    <div class="right-column">
+
+      <!-- Status Card -->
+      <section class="glass-card status-card">
+        <h2><i data-lucide="activity"></i> Current Session</h2>
+
+        <div class="status-grid">
+          <div class="status-item">
+            <label>Casting Status</label>
+            <span class="status-value idle" id="cast-status-label">Idle</span>
+          </div>
+          <div class="status-item">
+            <label>Connected IP</label>
+            <span class="status-value" id="cast-ip-label">-</span>
+          </div>
+        </div>
+
+        <div class="form-group mt-05" id="active-url-group">
+          <label>Active URL</label>
+          <input type="text" id="active-url-display" readonly class="url-display" value="-">
+        </div>
+      </section>
+
+      <!-- Presets/History Card -->
+      <section class="glass-card history-card">
+        <div class="section-header">
+          <h2><i data-lucide="bookmark"></i> Saved Presets</h2>
+          <button type="button" class="btn-secondary-sm" id="btn-create-preset">
+            <i data-lucide="plus-circle"></i> Add Preset
+          </button>
+        </div>
+
+        <div class="history-list" id="history-list">
+          <div class="empty-state">No presets saved yet.</div>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- Bottom: Logs Console -->
+    <section class="glass-card terminal-card">
+      <div class="terminal-header">
+        <h2><i data-lucide="terminal"></i> Stream Output Logs</h2>
+        <div class="terminal-controls">
+          <button type="button" class="btn-secondary-sm" id="btn-clear-logs">
+            <i data-lucide="trash-2" class="icon-sm"></i> Clear Logs
+          </button>
+          <button type="button" class="btn-secondary-sm btn-auto-scroll" id="btn-toggle-autoscroll">
+            <i data-lucide="check" class="icon-sm"></i> Auto Scroll
+          </button>
+        </div>
+      </div>
+
+      <div class="terminal-body" id="terminal-body">
+        <div class="log-line log-system">[System] Console ready. Logs will stream here when casting starts.</div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Modal: Preset Manager -->
+  <div class="modal-overlay" id="preset-modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 class="modal-title" id="modal-title">Save Stream Preset</h3>
+        <button type="button" class="btn-icon" id="btn-close-modal" aria-label="Close modal">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+
+      <form id="preset-form" onsubmit="return false;">
+        <input type="hidden" id="preset-id">
+
+        <div class="form-group">
+          <label for="preset-name">Preset Name</label>
+          <input type="text" id="preset-name" placeholder="e.g. My Favorite Stream" required>
+        </div>
+
+        <div class="form-group mt-1">
+          <label for="preset-url">Stream URL</label>
+          <input type="url" id="preset-url" placeholder="https://" required>
+        </div>
+
+        <!-- Custom Headers inside Modal -->
+        <div class="form-group mt-1">
+          <div class="headers-manager">
+            <div class="headers-title-row">
+              <label>Preset Headers</label>
+              <button type="button" class="btn-secondary-sm" id="btn-modal-add-header">
+                <i data-lucide="plus" class="icon-sm"></i> Add
+              </button>
+            </div>
+            <div class="headers-list" id="modal-headers-list">
+              <!-- Preset Header rows -->
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-cancel" id="btn-cancel-modal">Cancel</button>
+          <button type="submit" class="btn btn-cast btn-save-preset" id="btn-save-preset">Save Preset</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Toast Notifications Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script>
+    // Initialize Lucide icons
+    lucide.createIcons();
+  </script>
+  <script src="js/app.js"></script>
+</body>
+</html>
