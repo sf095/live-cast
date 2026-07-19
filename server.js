@@ -27,8 +27,15 @@ app.use(
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Request logging middleware (query string redacted to prevent credential leaks)
+app.use((req, res, next) => {
+  const safePath = req.path + (Object.keys(req.query).length ? '?...' : '');
+  castManager.appendLog('System', `Incoming HTTP Request: ${req.method} ${safePath} from ${req.ip}`);
+  next();
+});
+
 // ── System Dependency Cache (checked once at startup) ─────────────────────────
-const systemStatus = { ytdlp: false, catt: false, vlc: false };
+const systemStatus = { ytdlp: false, catt: false, vlc: false, atvremote: false };
 
 try {
   execSync('which yt-dlp', { stdio: 'ignore' });
@@ -39,6 +46,11 @@ try {
   execSync('which catt', { stdio: 'ignore' });
   systemStatus.catt = true;
 } catch (e) { /* catt not found */ }
+
+try {
+  execSync('which atvremote', { stdio: 'ignore' });
+  systemStatus.atvremote = true;
+} catch (e) { /* atvremote not found */ }
 
 if (fs.existsSync(VLC_PATH)) {
   systemStatus.vlc = true;
@@ -53,79 +65,188 @@ app.get('/api/status', (_req, res) => {
   res.json(systemStatus);
 });
 
-// GET: Discover Chromecast devices via catt scan
-app.get('/api/devices', (req, res) => {
-  const catt = spawn('catt', ['scan']);
-  let stdoutData = '';
-  let stderrData = '';
-
-  // Timeout: kill catt if scan takes longer than 30 seconds
-  const scanTimeout = setTimeout(() => {
-    catt.kill('SIGKILL');
-    if (!res.headersSent) {
-      res.status(504).json({
-        success: false,
-        error: 'Device scan timed out after 30 seconds.',
-      });
-    }
-  }, 30000);
-
-  catt.stdout.on('data', (data) => {
-    stdoutData += data.toString();
-  });
-
-  catt.stderr.on('data', (data) => {
-    stderrData += data.toString();
-  });
-
-  catt.on('close', (code) => {
-    clearTimeout(scanTimeout);
-    if (res.headersSent) return;
-
-    const devices = [];
-    const lines = stdoutData.split('\n');
-
-    // Pattern: "IP - Name - Info" or "IP - Name"
-    const regex = /^\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*-\s*([^-]+)(?:\s*-\s*(.+))?$/;
-
-    lines.forEach((line) => {
-      const match = line.match(regex);
-      if (match) {
-        devices.push({
-          ip: match[1].trim(),
-          name: match[2].trim(),
-          info: match[3] ? match[3].trim() : 'Unknown Device',
-        });
-      }
-    });
-
-    res.json({
-      success: true,
-      devices,
-      rawOutput: stdoutData,
-      exitCode: code,
-    });
-  });
-
-  catt.on('error', (err) => {
-    clearTimeout(scanTimeout);
-    if (!res.headersSent) {
-      res.status(500).json({
-        success: false,
-        error: err.message,
-      });
-    }
-  });
+// POST: Store custom headers and return a single-use token (prevents credential leaks in URLs)
+app.post('/api/headers', (req, res) => {
+  const { headers } = req.body;
+  if (headers !== undefined && (typeof headers !== 'object' || headers === null || Array.isArray(headers))) {
+    return res.status(400).json({ success: false, error: 'Headers must be a plain object.' });
+  }
+  const token = castManager.storeHeaders(headers || {});
+  res.json({ success: true, token });
 });
 
-// POST: Start casting a stream to a selected Chromecast
-app.post('/api/cast', (req, res) => {
-  const { url, ip, headers } = req.body;
+// ── Device scan cache (prevents duplicate process spawns) ──────────────────────
+const SCAN_CACHE_TTL_MS = 30_000; // 30 seconds
+let scanCache = { data: null, timestamp: 0, inProgress: false };
+
+// Helper functions for scanning devices
+function runChromecastScan() {
+  return new Promise((resolve) => {
+    if (!systemStatus.catt) {
+      return resolve([]);
+    }
+
+    const catt = spawn('catt', ['scan']);
+    let stdoutData = '';
+
+    const timeout = setTimeout(() => {
+      catt.kill('SIGKILL');
+    }, 20000); // Scan up to 20s
+
+    catt.stdout.on('data', (data) => {
+      stdoutData += data.toString();
+    });
+
+    catt.on('close', () => {
+      clearTimeout(timeout);
+      const devices = [];
+      const lines = stdoutData.split('\n');
+      const regex = /^\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*-\s*([^-]+)(?:\s*-\s*(.+))?$/;
+
+      lines.forEach((line) => {
+        const match = line.match(regex);
+        if (match) {
+          devices.push({
+            ip: match[1].trim(),
+            name: match[2].trim(),
+            info: match[3] ? match[3].trim() : 'Chromecast Device',
+            type: 'chromecast',
+          });
+        }
+      });
+      resolve(devices);
+    });
+
+    catt.on('error', () => {
+      clearTimeout(timeout);
+      resolve([]);
+    });
+  });
+}
+
+function parseAtvremoteScan(stdout) {
+  const devices = [];
+  const lines = stdout.split('\n');
+  let currentDevice = null;
+
+  lines.forEach((line) => {
+    const nameMatch = line.match(/^\s*Name:\s*(.+)$/i);
+    const modelMatch = line.match(/^\s*Model\/SW:\s*(.+)$/i);
+    const addressMatch = line.match(/^\s*Address:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i);
+    const idMatch = line.match(/^\s*-\s*(.+)$/);
+
+    if (nameMatch) {
+      if (currentDevice && currentDevice.ip && currentDevice.name) {
+        devices.push(currentDevice);
+      }
+      currentDevice = {
+        name: nameMatch[1].trim(),
+        ip: '',
+        id: '',
+        info: 'AirPlay Device',
+        type: 'airplay',
+      };
+    } else if (modelMatch && currentDevice) {
+      currentDevice.info = `${modelMatch[1].trim()} (AirPlay)`;
+    } else if (addressMatch && currentDevice) {
+      currentDevice.ip = addressMatch[1].trim();
+    } else if (idMatch && currentDevice && !currentDevice.id) {
+      currentDevice.id = idMatch[1].trim();
+    }
+  });
+
+  if (currentDevice && currentDevice.ip && currentDevice.name) {
+    devices.push(currentDevice);
+  }
+
+  return devices;
+}
+
+function runAirPlayScan() {
+  return new Promise((resolve) => {
+    if (!systemStatus.atvremote) {
+      return resolve([]);
+    }
+
+    const atv = spawn('atvremote', ['scan']);
+    let stdoutData = '';
+
+    const timeout = setTimeout(() => {
+      atv.kill('SIGKILL');
+    }, 20000); // Scan up to 20s
+
+    atv.stdout.on('data', (data) => {
+      stdoutData += data.toString();
+    });
+
+    atv.on('close', () => {
+      clearTimeout(timeout);
+      const devices = parseAtvremoteScan(stdoutData);
+      resolve(devices);
+    });
+
+    atv.on('error', () => {
+      clearTimeout(timeout);
+      resolve([]);
+    });
+  });
+}
+
+// GET: Discover devices (Chromecast and AirPlay) — cached for 30s
+app.get('/api/devices', async (req, res) => {
+  // Return cached result if fresh
+  const now = Date.now();
+  if (scanCache.data && (now - scanCache.timestamp) < SCAN_CACHE_TTL_MS) {
+    return res.json(scanCache.data);
+  }
+
+  // Prevent concurrent scans
+  if (scanCache.inProgress) {
+    // Return stale cache if available, otherwise wait
+    if (scanCache.data) {
+      return res.json(scanCache.data);
+    }
+    return res.status(503).json({ success: false, error: 'Scan already in progress. Please retry.' });
+  }
+
+  scanCache.inProgress = true;
+  try {
+    const [chromecasts, airplays] = await Promise.all([
+      runChromecastScan(),
+      runAirPlayScan(),
+    ]);
+
+    const allDevices = [...chromecasts, ...airplays];
+
+    scanCache.data = { success: true, devices: allDevices };
+    scanCache.timestamp = Date.now();
+
+    res.json(scanCache.data);
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  } finally {
+    scanCache.inProgress = false;
+  }
+});
+
+// POST: Start casting a stream to a selected device (Chromecast/AirPlay)
+app.post('/api/cast', async (req, res) => {
+  const { url, ip, headers, deviceType, deviceId } = req.body;
 
   if (!url || !ip) {
     return res.status(400).json({
       success: false,
-      error: 'URL and Chromecast IP are required.',
+      error: 'URL and device IP are required.',
+    });
+  }
+
+  if (deviceType && deviceType !== 'chromecast' && deviceType !== 'airplay') {
+    return res.status(400).json({
+      success: false,
+      error: 'Invalid device type. Supported: chromecast, airplay',
     });
   }
 
@@ -163,7 +284,7 @@ app.post('/api/cast', (req, res) => {
     });
   }
 
-  const result = castManager.startCast(url, ip, headers);
+  const result = await castManager.startCast(url, ip, headers, deviceType || 'chromecast', deviceId || '');
 
   if (!result.success) {
     return res.status(400).json(result);
@@ -183,8 +304,95 @@ app.post('/api/cast/stop', (_req, res) => {
 });
 
 // GET: Current casting session status & logs
-app.get('/api/cast/status', (_req, res) => {
-  res.json(castManager.getSessionStatus());
+app.get('/api/cast/status', (req, res) => {
+  const since = parseInt(req.query.since, 10) || 0;
+  res.json(castManager.getSessionStatus(since));
+});
+
+// GET: Local stream proxy for AirPlay
+app.get(['/api/stream', '/api/stream.m3u8', '/api/stream.mp4', '/api/stream.ts'], (req, res) => {
+  const { url, token } = req.query;
+
+  if (!url) {
+    return res.status(400).send('URL query parameter is required.');
+  }
+
+  // Validate URL length
+  if (url.length > 4096) {
+    return res.status(400).send('URL exceeds maximum length of 4096 characters.');
+  }
+
+  // Validate URL scheme to prevent SSRF (only http/https allowed)
+  if (!castManager.isValidURL(url)) {
+    return res.status(400).send('Invalid URL. Only http/https URLs are supported.');
+  }
+
+  // Retrieve headers from token store (secure, single-use)
+  let parsedHeaders = {};
+  if (token) {
+    const stored = castManager.retrieveHeaders(token);
+    if (stored) {
+      parsedHeaders = stored;
+    }
+    // If token not found (expired/used), proceed with no headers
+  }
+
+  // Build yt-dlp arguments
+  const ytdlpArgs = [];
+  const headerKeys = [];
+  if (parsedHeaders && typeof parsedHeaders === 'object') {
+    Object.entries(parsedHeaders).forEach(([key, value]) => {
+      if (key.trim() && value.trim()) {
+        ytdlpArgs.push('--add-header', `${key.trim()}: ${value.trim()}`);
+        headerKeys.push(key.trim());
+      }
+    });
+  }
+  ytdlpArgs.push('-o', '-', url);
+
+  castManager.appendLog('System', `Stream Proxy: Spawning yt-dlp for ${url} with headers: ${headerKeys.join(', ') || 'none'}`);
+
+  try {
+    const ytdlpProc = spawn('yt-dlp', ytdlpArgs);
+    castManager.registerProxyProc(ytdlpProc);
+
+    if (url.includes('m3u8')) {
+      res.setHeader('Content-Type', 'video/mp2t');
+    } else {
+      res.setHeader('Content-Type', 'video/mp4');
+    }
+
+    // Pipe yt-dlp stdout directly to Express response
+    ytdlpProc.stdout.pipe(res);
+
+    // Capture stderr logs
+    ytdlpProc.stderr.on('data', (data) => {
+      castManager.appendLog('yt-dlp-proxy', data);
+    });
+
+    // Handle process exits
+    ytdlpProc.on('exit', (code, signal) => {
+      castManager.appendLog('yt-dlp-proxy', `Process exited with code ${code} and signal ${signal}`);
+    });
+
+    // Handle connection close (Apple TV disconnects or stops playing)
+    req.on('close', () => {
+      castManager.appendLog('System', `Stream Proxy: Client disconnected. Killing proxy yt-dlp process.`);
+      ytdlpProc.kill('SIGKILL');
+    });
+
+    ytdlpProc.on('error', (err) => {
+      castManager.appendLog('yt-dlp-proxy-error', err.message);
+      if (!res.headersSent) {
+        res.status(500).send(`Streaming error: ${err.message}`);
+      }
+    });
+  } catch (err) {
+    castManager.appendLog('System-Error', `Failed to start stream proxy: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(500).send(`Failed to start stream proxy: ${err.message}`);
+    }
+  }
 });
 
 // ── History CRUD ──────────────────────────────────────────────────────────────

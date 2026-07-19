@@ -23,6 +23,7 @@ const el = {
   deps: {
     ytdlp: document.getElementById('dep-ytdlp'),
     catt: document.getElementById('dep-catt'),
+    atvremote: document.getElementById('dep-atvremote'),
     vlc: document.getElementById('dep-vlc'),
   },
 
@@ -134,6 +135,7 @@ async function checkSystemStatus() {
     const status = await res.json();
     updateBadge(el.deps.ytdlp, status.ytdlp);
     updateBadge(el.deps.catt, status.catt);
+    updateBadge(el.deps.atvremote, status.atvremote);
     updateBadge(el.deps.vlc, status.vlc);
   } catch (err) {
     console.error('Failed to get system dependency status:', err);
@@ -154,8 +156,8 @@ async function scanDevices() {
   el.controls.btnScan.disabled = true;
   el.controls.scanIcon.classList.add('spinner');
 
-  el.controls.deviceSelect.innerHTML = '<option value="" disabled selected>Scanning for Chromecasts...</option>';
-  appendSystemLog('Scanning for Chromecasts via catt scan...');
+  el.controls.deviceSelect.innerHTML = '<option value="" disabled selected>Scanning for devices...</option>';
+  appendSystemLog('Scanning for Chromecasts and AirPlay devices...');
 
   try {
     const res = await fetch('/api/devices');
@@ -166,8 +168,8 @@ async function scanDevices() {
       populateDeviceSelect();
       appendSystemLog(`Scan complete. Found ${data.devices.length} device(s).`);
       const msg = data.devices.length > 0
-        ? `Discovered ${data.devices.length} Chromecast device(s)`
-        : 'No Chromecast devices found.';
+        ? `Discovered ${data.devices.length} device(s)`
+        : 'No devices found.';
       showToast(msg, data.devices.length > 0 ? 'success' : 'info');
     } else {
       appendErrorLog(`Scan failed: ${data.error || 'Unknown error'}`);
@@ -192,7 +194,7 @@ function populateDeviceSelect() {
   if (state.devices.length === 0) {
     const option = document.createElement('option');
     option.value = '';
-    option.textContent = 'No Chromecasts found';
+    option.textContent = 'No devices found';
     option.disabled = true;
     el.controls.deviceSelect.appendChild(option);
     return;
@@ -200,12 +202,12 @@ function populateDeviceSelect() {
 
   state.devices.forEach((dev) => {
     const option = document.createElement('option');
-    option.value = dev.ip;
-    option.textContent = `${dev.name} (${dev.ip})`;
+    option.value = JSON.stringify({ ip: dev.ip, type: dev.type, id: dev.id || '' });
+    option.textContent = `${dev.name} (${dev.ip}) [${dev.type === 'airplay' ? 'AirPlay' : 'Chromecast'}]`;
     el.controls.deviceSelect.appendChild(option);
   });
 
-  if (currentVal && state.devices.some((d) => d.ip === currentVal)) {
+  if (currentVal && state.devices.some((d) => JSON.stringify({ ip: d.ip, type: d.type, id: d.id || '' }) === currentVal)) {
     el.controls.deviceSelect.value = currentVal;
   }
 }
@@ -264,10 +266,10 @@ function renderHeaders(container, headersObj) {
 
 async function handleCastStart() {
   const url = el.controls.streamUrl.value.trim();
-  const ip = el.controls.deviceSelect.value;
+  const deviceVal = el.controls.deviceSelect.value;
 
-  if (!ip) {
-    showToast('Please select a Chromecast device first.', 'warning');
+  if (!deviceVal) {
+    showToast('Please select a target cast device first.', 'warning');
     return;
   }
   if (!url) {
@@ -275,6 +277,16 @@ async function handleCastStart() {
     return;
   }
 
+  let ip, deviceType, deviceId;
+  try {
+    const parsed = JSON.parse(deviceVal);
+    ip = parsed.ip;
+    deviceType = parsed.type;
+    deviceId = parsed.id || '';
+  } catch {
+    showToast('Invalid device selection. Please re-scan.', 'error');
+    return;
+  }
   const headers = serializeHeaders(el.controls.headersList);
 
   el.controls.btnCast.disabled = true;
@@ -284,7 +296,7 @@ async function handleCastStart() {
     const res = await fetch('/api/cast', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, ip, headers }),
+      body: JSON.stringify({ url, ip, deviceType, deviceId, headers }),
     });
     const data = await res.json();
 
@@ -335,10 +347,11 @@ function resetCastButtons() {
 
 function startStatusPolling() {
   stopStatusPolling(); // Clear any existing timer
+  state.logCount = 0; // Reset cursor for new session
 
   state.pollTimer = setInterval(async () => {
     try {
-      const res = await fetch('/api/cast/status');
+      const res = await fetch(`/api/cast/status?since=${state.logCount}`);
       const data = await res.json();
       updateSessionStatusUI(data);
 
@@ -360,6 +373,85 @@ function stopStatusPolling() {
   }
 }
 
+let hlsInstance = null;
+let activePlayerUrl = null;
+
+async function updatePlayerPreview(url, headers) {
+  const playerCard = document.getElementById('player-card');
+  const video = document.getElementById('preview-player');
+  if (!playerCard || !video) return;
+
+  if (!url) {
+    playerCard.style.display = 'none';
+    if (hlsInstance) {
+      hlsInstance.destroy();
+      hlsInstance = null;
+    }
+    video.src = '';
+    activePlayerUrl = null;
+    return;
+  }
+
+  if (activePlayerUrl === url) return;
+  activePlayerUrl = url;
+
+  playerCard.style.display = 'block';
+
+  // Store headers server-side and get a single-use token (never in query string)
+  let headerToken = '';
+  try {
+    const tokenRes = await fetch('/api/headers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ headers: headers || {} }),
+    });
+    const tokenData = await tokenRes.json();
+    if (tokenData.success) {
+      headerToken = tokenData.token;
+    }
+  } catch (e) {
+    console.error('Failed to store headers:', e);
+  }
+
+  // Construct local HLS proxy URL with token
+  const localIp = window.location.hostname;
+  const port = window.location.port || '3000';
+  const encodedUrl = encodeURIComponent(url);
+  const tokenParam = headerToken ? `&token=${headerToken}` : '';
+  const proxyUrl = `http://${localIp}:${port}/api/stream?url=${encodedUrl}${tokenParam}`;
+
+  if (url.includes('m3u8')) {
+    if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+      if (hlsInstance) {
+        hlsInstance.destroy();
+      }
+      hlsInstance = new Hls({
+        maxMaxBufferLength: 10,
+        enableWorker: true,
+      });
+      hlsInstance.loadSource(proxyUrl);
+      hlsInstance.attachMedia(video);
+      hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+        video.play().catch((e) => console.log('Autoplay blocked:', e));
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = proxyUrl;
+      video.addEventListener('loadedmetadata', () => {
+        video.play().catch((e) => console.log('Autoplay blocked:', e));
+      });
+    } else {
+      video.src = proxyUrl;
+    }
+  } else {
+    if (hlsInstance) {
+      hlsInstance.destroy();
+      hlsInstance = null;
+    }
+    video.src = proxyUrl;
+    video.play().catch((e) => console.log('Autoplay blocked:', e));
+  }
+}
+
 function updateSessionStatusUI(session) {
   state.castStatus = session.status;
 
@@ -376,15 +468,18 @@ function updateSessionStatusUI(session) {
     if (!el.controls.streamUrl.value.trim()) {
       el.controls.streamUrl.value = session.url;
     }
+
+    // Trigger local player preview
+    updatePlayerPreview(session.url, session.headers);
   } else {
     resetCastButtons();
+    updatePlayerPreview(null);
   }
 
-  // Render only new log lines
-  if (session.logs && session.logs.length > state.logCount) {
-    const newLogs = session.logs.slice(state.logCount);
-    state.logCount = session.logs.length;
-    appendLogsToTerminal(newLogs);
+  // Render new log lines (server already returns only new ones)
+  if (session.logs && session.logs.length > 0) {
+    state.logCount = session.logCount || (state.logCount + session.logs.length);
+    appendLogsToTerminal(session.logs);
   }
 }
 
