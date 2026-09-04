@@ -1,56 +1,95 @@
-# Technical Implementation Plan: AirPlay Support
+# Implementation Plan: Chromecast & AirPlay Volume Control
 
-## Phase 1: Environment & Dependency Check
-- **Objective**: Ensure `pyatv` (`atvremote`) is installed and detectable by the system.
-- [x] Task 1.1: Install `pyatv` via pip.
-  - Verify: Run `atvremote --version` (Verified)
-- [x] Task 1.2: Update dependency status check in `server.js` and frontend.
-  - Verify: `atvremote` status displays green/active badge on the top right of the dashboard. (Verified)
+## Component Architecture & Dependencies
 
-## Phase 2: Local Network Resolver
-- **Objective**: Dynamically determine the local Mac IP address so the AirPlay receiver can connect to the proxy stream.
-- [x] Task 2.1: Create `services/networkUtils.js` module.
-  - Verify: Write a short test script in `scratch/test_ip.js` to print local IPv4. (Verified: printed `192.168.1.166`)
+```
+┌────────────────────────────────────────────────────────┐
+│               Web Frontend Dashboard                   │
+│   (Slider, Mute Toggle, Step +/- Buttons, Live Badge)  │
+│   public/index.html & public/css/style.css             │
+└──────────────────────────┬─────────────────────────────┘
+                           │ Debounced fetch (200ms)
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│               Frontend Controller                      │
+│   public/js/app.js (State sync, optimistic UI)        │
+└──────────────────────────┬─────────────────────────────┘
+                           │ POST /api/cast/volume
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│               Express API Route                        │
+│   server.js (Input validation, active session check)   │
+└──────────────────────────┬─────────────────────────────┘
+                           │ setVolume(level, action)
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│               Cast Session Manager                     │
+│   services/castManager.js (Process orchestration)      │
+└────────────┬─────────────────────────────┬─────────────┘
+             │                             │
+    deviceType === 'chromecast'    deviceType === 'airplay'
+             ▼                             ▼
+┌───────────────────────────┐ ┌───────────────────────────┐
+│     catt volume <lvl>     │ │ playAirplay.py volume     │
+│   (Chromecast Cast V2)    │ │ (pyatv.interface.Audio)   │
+└───────────────────────────┘ └───────────────────────────┘
+```
 
-## Phase 3: Express Stream Proxy Implementation
-- **Objective**: Handle custom HTTP headers and YouTube/dynamic streams via local proxying.
-- [x] Task 3.1: Implement `/api/stream` endpoint in `server.js`.
-  - Content-Type set to `video/mp4` or a chunked stream.
-  - Spawn `yt-dlp` with the requested URL and custom HTTP headers.
-  - Pipe `yt-dlp` stdout to Express `res` stream.
-  - Ensure process cleanup on connection close/client abort.
-  - Verify: Use a tool or curl `http://localhost:3000/api/stream?url=<direct-video-url>` and confirm it downloads/streams. (Verified logic)
+---
 
-## Phase 4: AirPlay Casting Service (`castManager.js`)
-- **Objective**: Extend casting management logic to handle AirPlay devices using `atvremote`.
-- [x] Task 4.1: Integrate `atvremote` play and stop commands inside `services/castManager.js`.
-  - Construct local proxy stream URL using the Mac IP from Phase 2.
-  - Execute `atvremote` to play the proxy URL.
-  - Implement `stopCasting` to send stop command to the Apple TV and kill the proxy `yt-dlp` process.
-  - Verify: Cast request starts/stops successfully. (Verified logic)
+## Phase Breakdown & Order of Implementation
 
-## Phase 5: Device Discovery
-- **Objective**: Scan Bonjour/mDNS for Apple TV / AirPlay devices on the network.
-- [x] Task 5.1: Modify `/api/devices` in `server.js` to run `atvremote scan` and combine output with Chromecast (`catt scan`) devices.
-  - Parse device details from `atvremote scan`.
-  - Verify: API returns a list containing both Chromecast and AirPlay devices. (Verified: `atvremote scan` outputs detected devices successfully)
+1. **Phase 1: Backend Audio Engines**
+   - Extend `services/playAirplay.py` with `volume`, `volume_up`, `volume_down` commands using `pyatv`.
+   - Verify `catt volume` and `playAirplay.py volume` execution from Node.
+2. **Phase 2: Service Layer & Session State**
+   - Implement `setVolume()`, `adjustVolume()`, and `setMute()` in `services/castManager.js`.
+   - Maintain `volume` and `isMuted` in `activeSession` and expose via `getSessionStatus()`.
+3. **Phase 3: Express API Endpoints**
+   - Add `POST /api/cast/volume` in `server.js` with comprehensive input validation.
+4. **Phase 4: Frontend UI Elements & Styling**
+   - Add volume control HTML widget into the "Current Session" card in `public/index.html`.
+   - Add dark-theme styles for slider, thumb, buttons, and disabled states in `public/css/style.css`.
+5. **Phase 5: Client-Side State & Event Wiring**
+   - Wire debounced slider events, step buttons, and mute toggle in `public/js/app.js`.
+   - Sync volume UI state during polling and disable when session is idle.
 
-## Phase 6: Frontend Controls Update
-- **Objective**: Update the user interface to support selecting and casting to AirPlay devices.
-- [x] Task 6.1: Update `public/index.html` and `public/js/app.js` to support AirPlay badge, device categorization, and passing device type parameter to `/api/cast`.
-  - Verify: Select dropdown groups Chromecast and AirPlay devices clearly. Casting to Apple TV displays active status and streams logs. (Verified labels and event payloads)
+---
 
-## Phase 7: Security Hardening & Code Quality
-- **Objective**: Address security and maintainability issues identified during code review.
-- [x] Task 7.1: Prevent SSRF in `/api/stream` proxy endpoint by validating URL schemes.
-- [x] Task 7.2: Replace query-string header passing with server-side single-use token store.
-- [x] Task 7.3: Redact query parameters from request logging middleware.
-- [x] Task 7.4: Switch device select values from pipe-delimited to JSON encoding.
-- [x] Task 7.5: Add SRI integrity hash to hls.js CDN script tag.
-- [x] Task 7.6: Add error/exit handlers to AirPlay stop command spawn.
-- [x] Task 7.7: Extract DLNA, AirPlay, and Chromecast casting into separate functions.
-- [x] Task 7.8: Add 30s TTL device scan cache with concurrent scan guard.
-- [x] Task 7.9: Implement cursor-based status polling to reduce bandwidth.
-- [x] Task 7.10: Use `PORT` env var consistently instead of hardcoded `3000`.
-- [x] Task 7.11: Move AirPlay auth error detection from generic logger to AirPlay handler.
-  - Verify: All Node.js files pass syntax check. Security review findings addressed.
+## Risk Analysis & Mitigation
+
+| Risk | Impact | Mitigation Strategy |
+|---|---|---|
+| Rapid slider drag floods network with CLI process spawns | High | Frontend debounces `input` events by 200ms. Backend drops overlapping volume requests if another volume command is actively executing. |
+| AirPlay smart TV doesn't support master volume | Medium | Graceful error handling in `playAirplay.py` falling back to `volume_up`/`volume_down` remote keys, logging user-friendly feedback in terminal. |
+| Subprocess hangs on unreachable device | Medium | Enforce strict 7-second execution timeout on all child processes spawned for volume. |
+| Volume desync between UI and physical TV | Low | Optimistic UI updates with instant percentage display, confirmed via status response. |
+
+---
+
+## Discrete Task Breakdown
+
+- [x] **Task 1: Extend `services/playAirplay.py` for volume control**
+  - **Acceptance**: Running `python3 services/playAirplay.py volume <ip> <lvl>` executes `atv.audio.set_volume()` and exits 0 on success.
+  - **Verify**: Run `python3 services/playAirplay.py` CLI test to verify argument parsing and volume command dispatch.
+  - **Files**: `services/playAirplay.py`
+
+- [x] **Task 2: Implement volume orchestration in `services/castManager.js`**
+  - **Acceptance**: `castManager.setVolume(level)` correctly dispatches to `catt` for Chromecast and `playAirplay.py` for AirPlay; updates session state and streams log entries.
+  - **Verify**: Node script invoking `setVolume` with validation checks.
+  - **Files**: `services/castManager.js`
+
+- [x] **Task 3: Add `POST /api/cast/volume` route and status integration in `server.js`**
+  - **Acceptance**: `POST /api/cast/volume` accepts `{ action, level, step, isMuted }`, validates inputs, rejects if not casting or bad payload, returns 200 with new volume state; `GET /api/cast/status` includes volume and isMuted.
+  - **Verify**: Curl test to `POST /api/cast/volume` with valid and invalid payloads.
+  - **Files**: `server.js`
+
+- [x] **Task 4: Design & markup volume controls in `public/index.html` & `public/css/style.css`**
+  - **Acceptance**: Volume slider, mute button, -/+ buttons, and percentage display rendered within the Current Session card; matches dark-mode glassmorphic styling.
+  - **Verify**: Inspect HTML layout and verify Lucide icons render properly.
+  - **Files**: `public/index.html`, `public/css/style.css`
+
+- [x] **Task 5: Implement debounced frontend volume control logic in `public/js/app.js`**
+  - **Acceptance**: Slider drag debounced to 200ms, +/- step buttons adjust by 5%, mute button toggles state and icon, controls disable when idle and enable when casting.
+  - **Verify**: End-to-end manual verification in browser and automated syntax/lint verification.
+  - **Files**: `public/js/app.js`

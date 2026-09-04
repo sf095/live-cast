@@ -44,23 +44,27 @@ let activeSession = {
   url: null,
   ip: null,
   headers: null,
+  keys: null,
   deviceType: 'chromecast', // 'chromecast' | 'airplay'
   deviceId: '', // Unique identifier for atvremote
   status: 'idle', // 'idle' | 'casting' | 'error'
+  volume: 50,
+  isMuted: false,
+  previousVolume: 50,
   logs: [],
   startTime: null,
 };
 
 let activeProxyProcs = [];
 
-// Secure header token store — headers are stored server-side
+// Secure header and key token store — stored server-side
 // and retrieved by token, never passed in query strings
 const headerTokenStore = new Map();
 const HEADER_TOKEN_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-function storeHeaders(headers) {
+function storeHeaders(headers, keys) {
   const token = crypto.randomBytes(16).toString('hex');
-  headerTokenStore.set(token, { headers, createdAt: Date.now() });
+  headerTokenStore.set(token, { headers, keys, createdAt: Date.now() });
   // Auto-expire stale tokens
   setTimeout(() => headerTokenStore.delete(token), HEADER_TOKEN_TTL_MS);
   return token;
@@ -69,8 +73,8 @@ function storeHeaders(headers) {
 function retrieveHeaders(token) {
   const entry = headerTokenStore.get(token);
   if (!entry) return null;
-  headerTokenStore.delete(token); // single-use
-  return entry.headers;
+  // Let the token persist for the 5-minute TTL to allow multiple player range/seek connections
+  return { headers: entry.headers, keys: entry.keys };
 }
 
 function registerProxyProc(proc) {
@@ -181,7 +185,7 @@ async function castViaDLNA(ip, proxyUrl, isHls) {
   await sendDlnaSOAP(ip, 'Stop', stopBody).catch(() => {});
 
   // Build valid DIDL-Lite metadata for strict TVs
-  const mimeType = isHls ? 'video/mp2t' : 'video/mp4';
+  const mimeType = (isHls || proxyUrl.includes('.ts')) ? 'video/mp2t' : 'video/mp4';
   const title = 'Live Cast Stream';
   const didlXml = `<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
     <item id="0" parentID="-1" restricted="1">
@@ -238,41 +242,59 @@ function castViaAirPlay(ip, proxyUrl) {
   const playScript = path.join(__dirname, 'playAirplay.py');
   const args = [playScript, 'play', ip, proxyUrl];
 
-  try {
-    activeSession.vlcProc = spawn('python3', args);
+  return new Promise((resolve, reject) => {
+    try {
+      const proc = spawn('python3', args);
+      activeSession.vlcProc = proc;
 
-    activeSession.vlcProc.stdout.on('data', (data) => appendLog('AirPlay', data));
-    activeSession.vlcProc.stderr.on('data', (data) => {
-      appendLog('AirPlay-Error', data);
-      // Detect auth errors inline (rather than in generic appendLog)
-      const line = data.toString();
-      if (line.includes('not authenticated') || line.includes('AuthenticationError')) {
-        const ts = new Date().toLocaleTimeString();
-        appendLog('System', `⚠️ PAIRING REQUIRED: This Apple TV / AirPlay receiver requires authentication.`);
-        appendLog('System', `Open a Terminal window on your Mac and run:`);
-        appendLog('System', `  atvremote --id "${activeSession.deviceId}" --protocol airplay pair`);
-        appendLog('System', `Enter the passcode shown on your TV screen. After pairing, try casting again!`);
-      }
-    });
+      let resolved = false;
 
-    activeSession.vlcProc.on('exit', (code, signal) => {
-      appendLog('AirPlay', `atvremote process exited with code ${code} and signal ${signal}`);
-      if (code !== 0 && activeSession.status === 'casting') {
-        appendLog('System', '⚠️ Direct casting is not supported by this TV. Streaming remains active for Local Player Preview.');
-      }
-    });
+      proc.stdout.on('data', (data) => {
+        appendLog('AirPlay', data);
+        const line = data.toString();
+        if (line.includes('Casting started successfully')) {
+          resolved = true;
+          resolve({ success: true });
+        }
+      });
 
-    activeSession.vlcProc.on('error', (err) => {
-      appendLog('AirPlay-Error', err.message);
-      activeSession.status = 'error';
-    });
+      proc.stderr.on('data', (data) => {
+        appendLog('AirPlay-Error', data);
+        const line = data.toString();
+        if (line.includes('not authenticated') || line.includes('AuthenticationError')) {
+          appendLog('System', `⚠️ PAIRING REQUIRED: This Apple TV / AirPlay receiver requires authentication.`);
+          appendLog('System', `Open a Terminal window on your Mac and run:`);
+          appendLog('System', `  atvremote --id "${activeSession.deviceId}" --protocol airplay pair`);
+          appendLog('System', `Enter the passcode shown on your TV screen. After pairing, try casting again!`);
+          resolved = true;
+          reject(new Error('Pairing required'));
+        }
+      });
 
-    return { success: true };
-  } catch (err) {
-    appendLog('System-Error', err.message);
-    activeSession.status = 'error';
-    return { success: false, error: err.message };
-  }
+      proc.on('exit', (code, signal) => {
+        appendLog('AirPlay', `atvremote process exited with code ${code} and signal ${signal}`);
+        if (!resolved) {
+          resolved = true;
+          if (code === 0) {
+            resolve({ success: true });
+          } else {
+            reject(new Error(`AirPlay process exited with code ${code}`));
+          }
+        }
+      });
+
+      proc.on('error', (err) => {
+        appendLog('AirPlay-Error', err.message);
+        if (!resolved) {
+          resolved = true;
+          reject(err);
+        }
+      });
+    } catch (err) {
+      appendLog('System-Error', err.message);
+      reject(err);
+    }
+  });
 }
 
 /**
@@ -301,7 +323,7 @@ function checkDLNASupport(ip) {
  * @param {string} deviceId - Unique device identifier for atvremote (optional)
  * @returns {{ success: boolean, error?: string }}
  */
-async function startCast(url, ip, headers, deviceType = 'chromecast', deviceId = '') {
+async function startCast(url, ip, headers, deviceType = 'chromecast', deviceId = '', keys = []) {
   // Validate inputs
   if (!url || !ip) {
     return { success: false, error: 'URL and IP are required.' };
@@ -318,6 +340,9 @@ async function startCast(url, ip, headers, deviceType = 'chromecast', deviceId =
   // Stop any active session first
   stopCasting();
 
+  const priorVolume = activeSession ? activeSession.volume : 50;
+  const priorPrevious = activeSession ? activeSession.previousVolume : 50;
+
   activeSession = {
     ytdlpProc: null,
     vlcProc: null,
@@ -325,9 +350,13 @@ async function startCast(url, ip, headers, deviceType = 'chromecast', deviceId =
     url,
     ip,
     headers,
+    keys,
     deviceType,
     deviceId,
     status: 'casting',
+    volume: priorVolume !== undefined ? priorVolume : 50,
+    isMuted: false,
+    previousVolume: priorPrevious !== undefined ? priorPrevious : 50,
     logs: [],
     startTime: new Date(),
   };
@@ -342,28 +371,36 @@ async function startCast(url, ip, headers, deviceType = 'chromecast', deviceId =
     const encodedUrl = encodeURIComponent(url);
 
     // Store headers server-side with a single-use token (never in query string)
-    const headerToken = storeHeaders(headers || {});
+    const headerToken = storeHeaders(headers || {}, keys || []);
 
     const isHls = url.includes('m3u8');
-    const proxyPath = isHls ? '/api/stream.m3u8' : '/api/stream.mp4';
+    const isDrm = keys && keys.length > 0;
+    const proxyPath = isHls ? '/api/stream.m3u8' : (isDrm ? '/api/stream.ts' : '/api/stream.mp4');
     const proxyUrl = `http://${localIp}:${SERVER_PORT}${proxyPath}?url=${encodedUrl}&token=${headerToken}`;
 
     appendLog('AirPlay', `Local stream proxy URL: ${proxyUrl}`);
 
-    // Try DLNA first, fall back to AirPlay on failure
-    const supportsDlna = await checkDLNASupport(ip);
-    if (supportsDlna) {
-      appendLog('System', `DLNA UPnP detected at ${ip}. Trying DLNA cast...`);
-      try {
-        await castViaDLNA(ip, proxyUrl, isHls);
-        return { success: true };
-      } catch (err) {
-        appendLog('System-Error', `DLNA cast failed: ${err.message}. Falling back to AirPlay.`);
+    // Try native AirPlay FIRST (correct and official protocol for Apple TV / AirPlay devices)
+    try {
+      appendLog('System', `Attempting native AirPlay cast to ${ip}...`);
+      const result = await castViaAirPlay(ip, proxyUrl);
+      return result;
+    } catch (err) {
+      appendLog('System', `Native AirPlay cast failed: ${err.message}. Trying DLNA fallback...`);
+      
+      // Fallback to DLNA if native AirPlay fails
+      const supportsDlna = await checkDLNASupport(ip);
+      if (supportsDlna) {
+        appendLog('System', `DLNA UPnP fallback detected at ${ip}. Trying DLNA cast...`);
+        try {
+          await castViaDLNA(ip, proxyUrl, isHls);
+          return { success: true };
+        } catch (dlnaErr) {
+          appendLog('System-Error', `DLNA fallback cast failed: ${dlnaErr.message}`);
+        }
       }
+      return { success: false, error: err.message };
     }
-
-    appendLog('AirPlay', `Spawning playAirplay.py to cast stream...`);
-    return castViaAirPlay(ip, proxyUrl);
   }
 
   // ── Chromecast / VLC path ────────────────────────────────────────────
@@ -451,10 +488,14 @@ function getSessionStatus(sinceIndex = 0) {
     status: activeSession.status,
     url: activeSession.url,
     ip: activeSession.ip,
+    deviceType: activeSession.deviceType,
+    volume: activeSession.volume !== undefined ? activeSession.volume : 50,
+    isMuted: activeSession.isMuted || false,
     startTime: activeSession.startTime,
     logs,
     logCount: activeSession.logs.length,
     headers: activeSession.headers,
+    keys: activeSession.keys,
   };
 }
 
@@ -495,10 +536,144 @@ function sendDlnaSOAP(ip, action, body) {
   });
 }
 
+/**
+ * Run a command with a strict timeout.
+ */
+function runCommandWithTimeout(cmd, args, timeoutMs = 7000) {
+  return new Promise((resolve, reject) => {
+    let proc;
+    let stdout = '';
+    let stderr = '';
+    let isSettled = false;
+
+    try {
+      proc = spawn(cmd, args);
+    } catch (err) {
+      return reject(err);
+    }
+
+    const timer = setTimeout(() => {
+      if (!isSettled) {
+        isSettled = true;
+        try { proc.kill('SIGKILL'); } catch (e) {}
+        reject(new Error(`Command "${cmd} ${args.join(' ')}" timed out after ${timeoutMs}ms`));
+      }
+    }, timeoutMs);
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    proc.on('close', (code) => {
+      if (!isSettled) {
+        isSettled = true;
+        clearTimeout(timer);
+        if (code === 0) {
+          resolve({ stdout, stderr });
+        } else {
+          reject(new Error(stderr.trim() || stdout.trim() || `Process exited with code ${code}`));
+        }
+      }
+    });
+
+    proc.on('error', (err) => {
+      if (!isSettled) {
+        isSettled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+  });
+}
+
+/**
+ * Change volume of active casting device.
+ * @param {object} params
+ * @param {'set'|'up'|'down'|'mute'} [params.action='set']
+ * @param {number} [params.level] - target volume 0-100
+ * @param {number} [params.step=5] - increment/decrement step
+ * @param {boolean} [params.isMuted] - target mute state
+ * @returns {Promise<{success: boolean, level: number, isMuted: boolean, error?: string}>}
+ */
+async function setVolume({ action = 'set', level, step = 5, isMuted } = {}) {
+  if (activeSession.status !== 'casting' || !activeSession.ip) {
+    return { success: false, error: 'No active casting session.' };
+  }
+
+  let targetLevel = activeSession.volume !== undefined ? activeSession.volume : 50;
+  let targetMute = activeSession.isMuted || false;
+
+  if (action === 'set') {
+    if (level === undefined || isNaN(Number(level))) {
+      return { success: false, error: 'Volume level must be a valid number.' };
+    }
+    targetLevel = Math.max(0, Math.min(100, Math.round(Number(level))));
+    targetMute = targetLevel === 0;
+  } else if (action === 'up') {
+    const delta = Math.max(1, Math.min(50, Math.round(Number(step) || 5)));
+    targetLevel = Math.min(100, targetLevel + delta);
+    targetMute = false;
+  } else if (action === 'down') {
+    const delta = Math.max(1, Math.min(50, Math.round(Number(step) || 5)));
+    targetLevel = Math.max(0, targetLevel - delta);
+    targetMute = targetLevel === 0;
+  } else if (action === 'mute') {
+    targetMute = Boolean(isMuted);
+    if (targetMute) {
+      if (activeSession.volume > 0) {
+        activeSession.previousVolume = activeSession.volume;
+      }
+      targetLevel = 0;
+    } else {
+      targetLevel = activeSession.previousVolume && activeSession.previousVolume > 0 ? activeSession.previousVolume : 50;
+    }
+  } else {
+    return { success: false, error: `Invalid volume action: ${action}` };
+  }
+
+  const { ip, deviceType } = activeSession;
+  appendLog('Volume', `Adjusting volume to ${targetLevel}% (mute: ${targetMute}) on ${ip} (${deviceType})...`);
+
+  try {
+    if (deviceType === 'chromecast') {
+      await runCommandWithTimeout('catt', ['-d', ip, 'volume', String(targetLevel)]);
+    } else if (deviceType === 'airplay') {
+      const playScript = path.join(__dirname, 'playAirplay.py');
+      await runCommandWithTimeout('python3', [playScript, 'volume', ip, String(targetLevel)]);
+    }
+
+    activeSession.volume = targetLevel;
+    activeSession.isMuted = targetMute;
+    if (targetLevel > 0) {
+      activeSession.previousVolume = targetLevel;
+    }
+
+    appendLog('Volume', `Successfully sent volume ${targetLevel}% command to ${ip}`);
+    if (deviceType === 'chromecast' && !activeSession.hasShownVolumeTip) {
+      activeSession.hasShownVolumeTip = true;
+      appendLog('Volume-Tip', 'If TV displays "Use your remote control", set Google TV Settings → Remotes & Accessories → Set up remote buttons → Volume control to "Chromecast".');
+    }
+    return {
+      success: true,
+      action,
+      level: targetLevel,
+      isMuted: targetMute,
+    };
+  } catch (err) {
+    appendLog('Volume-Error', `Failed to set volume on ${ip}: ${err.message}`);
+    return {
+      success: false,
+      error: `Failed to set volume: ${err.message}`,
+      level: activeSession.volume,
+      isMuted: activeSession.isMuted,
+    };
+  }
+}
+
 module.exports = {
   startCast,
   stopCasting,
   getSessionStatus,
+  setVolume,
   appendLog: appendLogSafe,
   shutdown,
   isValidIP,

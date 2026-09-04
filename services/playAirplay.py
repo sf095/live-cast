@@ -62,13 +62,13 @@ HttpConnection.send_and_receive = patched_send_and_receive
 
 async def main():
     if len(sys.argv) < 3:
-        print("Usage: playAirplay.py <command> <ip> [url]")
-        print("Commands: play, stop")
+        print("Usage: playAirplay.py <command> <ip> [param]")
+        print("Commands: play, stop, volume, volume_up, volume_down, get_volume")
         sys.exit(1)
 
     command = sys.argv[1]
     ip = sys.argv[2]
-    url = sys.argv[3] if len(sys.argv) > 3 else None
+    param = sys.argv[3] if len(sys.argv) > 3 else None
 
     loop = asyncio.get_running_loop()
     storage = FileStorage.default_storage(loop)
@@ -84,11 +84,11 @@ async def main():
 
     try:
         if command == "play":
-            if not url:
+            if not param:
                 print("Error: play command requires a URL", file=sys.stderr, flush=True)
                 sys.exit(1)
             # Send play command
-            await atv.stream.play_url(url)
+            await atv.stream.play_url(param)
             print("Casting started successfully.", flush=True)
             # Keep process alive to ensure connection remains stable during initial buffer
             await asyncio.sleep(5)
@@ -96,6 +96,46 @@ async def main():
             # Send stop command
             await atv.remote_control.stop()
             print("Casting stopped.", flush=True)
+        elif command == "volume":
+            if param is None:
+                print("Error: volume command requires a level (0-100)", file=sys.stderr, flush=True)
+                sys.exit(1)
+            lvl = max(0.0, min(100.0, float(param)))
+            try:
+                await atv.audio.set_volume(lvl)
+                print(f"Volume set to {int(lvl)}%.", flush=True)
+            except Exception as e:
+                print(f"Error setting volume: {e}", file=sys.stderr, flush=True)
+                sys.exit(1)
+        elif command == "volume_up":
+            try:
+                await atv.audio.volume_up()
+                print("Volume increased.", flush=True)
+            except Exception:
+                try:
+                    await atv.remote_control.volume_up()
+                    print("Volume increased via remote control.", flush=True)
+                except Exception as e:
+                    print(f"Error increasing volume: {e}", file=sys.stderr, flush=True)
+                    sys.exit(1)
+        elif command == "volume_down":
+            try:
+                await atv.audio.volume_down()
+                print("Volume decreased.", flush=True)
+            except Exception:
+                try:
+                    await atv.remote_control.volume_down()
+                    print("Volume decreased via remote control.", flush=True)
+                except Exception as e:
+                    print(f"Error decreasing volume: {e}", file=sys.stderr, flush=True)
+                    sys.exit(1)
+        elif command == "get_volume":
+            try:
+                vol = atv.audio.volume
+                print(f"Volume: {vol}", flush=True)
+            except Exception as e:
+                print(f"Error getting volume: {e}", file=sys.stderr, flush=True)
+                sys.exit(1)
         else:
             print(f"Error: Unknown command: {command}", file=sys.stderr, flush=True)
             sys.exit(1)

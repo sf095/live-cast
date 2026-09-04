@@ -35,7 +35,8 @@ app.use((req, res, next) => {
 });
 
 // ── System Dependency Cache (checked once at startup) ─────────────────────────
-const systemStatus = { ytdlp: false, catt: false, vlc: false, atvremote: false };
+const systemStatus = { ytdlp: false, catt: false, vlc: false, atvremote: false, shakapackager: false };
+let shakaBin = 'shaka-packager';
 
 try {
   execSync('which yt-dlp', { stdio: 'ignore' });
@@ -52,6 +53,17 @@ try {
   systemStatus.atvremote = true;
 } catch (e) { /* atvremote not found */ }
 
+try {
+  execSync('which shaka-packager', { stdio: 'ignore' });
+  systemStatus.shakapackager = true;
+} catch (e) {
+  const SHAKA_PATH = '/Users/hientranthanh/.local/bin/shaka-packager';
+  if (fs.existsSync(SHAKA_PATH)) {
+    systemStatus.shakapackager = true;
+    shakaBin = SHAKA_PATH;
+  }
+}
+
 if (fs.existsSync(VLC_PATH)) {
   systemStatus.vlc = true;
 }
@@ -65,13 +77,16 @@ app.get('/api/status', (_req, res) => {
   res.json(systemStatus);
 });
 
-// POST: Store custom headers and return a single-use token (prevents credential leaks in URLs)
+// POST: Store custom headers and keys and return a single-use token (prevents credential leaks in URLs)
 app.post('/api/headers', (req, res) => {
-  const { headers } = req.body;
+  const { headers, keys } = req.body;
   if (headers !== undefined && (typeof headers !== 'object' || headers === null || Array.isArray(headers))) {
     return res.status(400).json({ success: false, error: 'Headers must be a plain object.' });
   }
-  const token = castManager.storeHeaders(headers || {});
+  if (keys !== undefined && !Array.isArray(keys)) {
+    return res.status(400).json({ success: false, error: 'Keys must be an array.' });
+  }
+  const token = castManager.storeHeaders(headers || {}, keys || []);
   res.json({ success: true, token });
 });
 
@@ -234,7 +249,7 @@ app.get('/api/devices', async (req, res) => {
 
 // POST: Start casting a stream to a selected device (Chromecast/AirPlay)
 app.post('/api/cast', async (req, res) => {
-  const { url, ip, headers, deviceType, deviceId } = req.body;
+  const { url, ip, headers, deviceType, deviceId, keys } = req.body;
 
   if (!url || !ip) {
     return res.status(400).json({
@@ -276,6 +291,24 @@ app.post('/api/cast', async (req, res) => {
     }
   }
 
+  // Validate keys is an array
+  if (keys !== undefined && !Array.isArray(keys)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Keys must be an array of objects.',
+    });
+  }
+  if (keys) {
+    for (const item of keys) {
+      if (typeof item !== 'object' || item === null || typeof item.kid !== 'string' || typeof item.key !== 'string') {
+        return res.status(400).json({
+          success: false,
+          error: 'Each key item must contain kid and key string properties.',
+        });
+      }
+    }
+  }
+
   // Validate URL length
   if (url.length > 4096) {
     return res.status(400).json({
@@ -284,7 +317,7 @@ app.post('/api/cast', async (req, res) => {
     });
   }
 
-  const result = await castManager.startCast(url, ip, headers, deviceType || 'chromecast', deviceId || '');
+  const result = await castManager.startCast(url, ip, headers, deviceType || 'chromecast', deviceId || '', keys || []);
 
   if (!result.success) {
     return res.status(400).json(result);
@@ -301,6 +334,53 @@ app.post('/api/cast', async (req, res) => {
 app.post('/api/cast/stop', (_req, res) => {
   castManager.stopCasting('User requested stop');
   res.json({ success: true, message: 'Casting stopped' });
+});
+
+// POST: Change volume of active cast session (Chromecast / AirPlay)
+app.post('/api/cast/volume', async (req, res) => {
+  const { action = 'set', level, step, isMuted } = req.body || {};
+
+  const allowedActions = ['set', 'up', 'down', 'mute'];
+  if (!allowedActions.includes(action)) {
+    return res.status(400).json({
+      success: false,
+      error: `Invalid action "${action}". Allowed: ${allowedActions.join(', ')}`,
+    });
+  }
+
+  if (action === 'set') {
+    if (level === undefined || typeof level !== 'number' || isNaN(level) || level < 0 || level > 100) {
+      return res.status(400).json({
+        success: false,
+        error: 'Level must be a number between 0 and 100 for action "set".',
+      });
+    }
+  }
+
+  if (action === 'mute' && typeof isMuted !== 'boolean') {
+    return res.status(400).json({
+      success: false,
+      error: 'isMuted must be a boolean for action "mute".',
+    });
+  }
+
+  if ((action === 'up' || action === 'down') && step !== undefined) {
+    if (typeof step !== 'number' || isNaN(step) || step <= 0 || step > 50) {
+      return res.status(400).json({
+        success: false,
+        error: 'Step must be a positive number up to 50.',
+      });
+    }
+  }
+
+  const result = await castManager.setVolume({ action, level, step, isMuted });
+
+  if (!result.success) {
+    const status = result.error && result.error.includes('No active') ? 400 : 500;
+    return res.status(status).json(result);
+  }
+
+  res.json(result);
 });
 
 // GET: Current casting session status & logs
@@ -327,14 +407,15 @@ app.get(['/api/stream', '/api/stream.m3u8', '/api/stream.mp4', '/api/stream.ts']
     return res.status(400).send('Invalid URL. Only http/https URLs are supported.');
   }
 
-  // Retrieve headers from token store (secure, single-use)
+  // Retrieve headers and keys from token store (secure, single-use)
   let parsedHeaders = {};
+  let parsedKeys = [];
   if (token) {
     const stored = castManager.retrieveHeaders(token);
     if (stored) {
-      parsedHeaders = stored;
+      parsedHeaders = stored.headers || {};
+      parsedKeys = stored.keys || [];
     }
-    // If token not found (expired/used), proceed with no headers
   }
 
   // Build yt-dlp arguments
@@ -348,49 +429,219 @@ app.get(['/api/stream', '/api/stream.m3u8', '/api/stream.mp4', '/api/stream.ts']
       }
     });
   }
+
+  if (parsedKeys.length > 0) {
+    if (!systemStatus.shakapackager) {
+      castManager.appendLog('System', `⚠️ WARNING: ClearKey DRM decryption requested but shaka-packager is not installed.`);
+    } else {
+      ytdlpArgs.push('--allow-unplayable-formats');
+      ytdlpArgs.push('-f', 'bestvideo');
+      // NOTE: do NOT use --downloader dash:native with -o - (stdout): it creates
+      // fragment temp files named '--FragN' which yt-dlp misinterprets as CLI flags.
+    }
+  }
+
   ytdlpArgs.push('-o', '-', url);
 
-  castManager.appendLog('System', `Stream Proxy: Spawning yt-dlp for ${url} with headers: ${headerKeys.join(', ') || 'none'}`);
+  if (parsedKeys.length > 0 && systemStatus.shakapackager) {
+    castManager.appendLog('System', `Stream Proxy: Spawning decrypted pipeline for ${url} using shaka-packager`);
 
-  try {
-    const ytdlpProc = spawn('yt-dlp', ytdlpArgs);
-    castManager.registerProxyProc(ytdlpProc);
+    let tempDir = null;
+    let ytdlpProc = null;
+    let shakaProc = null;
+    let ffmpegProc = null;
 
-    if (url.includes('m3u8')) {
-      res.setHeader('Content-Type', 'video/mp2t');
-    } else {
-      res.setHeader('Content-Type', 'video/mp4');
-    }
+    try {
+      const crypto = require('crypto');
+      tempDir = path.join('/tmp', `live-cast-${crypto.randomUUID()}`);
+      fs.mkdirSync(tempDir, { recursive: true });
 
-    // Pipe yt-dlp stdout directly to Express response
-    ytdlpProc.stdout.pipe(res);
+      const pipeIn = path.join(tempDir, 'input.mp4');
+      const pipeOut = path.join(tempDir, 'output.mp4');
 
-    // Capture stderr logs
-    ytdlpProc.stderr.on('data', (data) => {
-      castManager.appendLog('yt-dlp-proxy', data);
-    });
+      execSync(`mkfifo "${pipeIn}" "${pipeOut}"`);
 
-    // Handle process exits
-    ytdlpProc.on('exit', (code, signal) => {
-      castManager.appendLog('yt-dlp-proxy', `Process exited with code ${code} and signal ${signal}`);
-    });
+      const cleanup = () => {
+        castManager.appendLog('System', `Stream Proxy: Cleaning up decryption pipeline.`);
+        if (ytdlpProc) {
+          try { ytdlpProc.kill('SIGKILL'); } catch (e) {}
+        }
+        if (shakaProc) {
+          try { shakaProc.kill('SIGKILL'); } catch (e) {}
+        }
+        if (ffmpegProc) {
+          try { ffmpegProc.kill('SIGKILL'); } catch (e) {}
+        }
+        if (tempDir && fs.existsSync(tempDir)) {
+          try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (e) {}
+        }
+      };
 
-    // Handle connection close (Apple TV disconnects or stops playing)
-    req.on('close', () => {
-      castManager.appendLog('System', `Stream Proxy: Client disconnected. Killing proxy yt-dlp process.`);
-      ytdlpProc.kill('SIGKILL');
-    });
+      const shakaKeysArgs = parsedKeys.map(k => `key_id=${k.kid.trim()}:key=${k.key.trim()}`).join(',');
+      const shakaArgs = [
+        `input=${pipeIn},stream=0,output=${pipeOut}`,
+        '--enable_raw_key_decryption',
+        '--keys', shakaKeysArgs
+      ];
 
-    ytdlpProc.on('error', (err) => {
-      castManager.appendLog('yt-dlp-proxy-error', err.message);
-      if (!res.headersSent) {
-        res.status(500).send(`Streaming error: ${err.message}`);
+      shakaProc = spawn(shakaBin, shakaArgs);
+      castManager.registerProxyProc(shakaProc);
+
+      ytdlpProc = spawn('yt-dlp', ytdlpArgs);
+      castManager.registerProxyProc(ytdlpProc);
+
+      // Pipe yt-dlp stdout into the input FIFO
+      const pipeInStream = fs.createWriteStream(pipeIn);
+      pipeInStream.on('error', (err) => {
+        castManager.appendLog('System', `pipeInStream error: ${err.message}`);
+        cleanup();
+      });
+      ytdlpProc.stdout.pipe(pipeInStream);
+
+      const isTsRequest = req.path.endsWith('.ts');
+
+      if (isTsRequest) {
+        castManager.appendLog('System', `Stream Proxy: Spawning H.264 transcoding pipeline with silent audio track for AirPlay (HEVC/H.264 -> H.264 MPEG-TS with silent AAC)`);
+        // Spawn ffmpeg to transcode video to H.264 via hardware acceleration, generate stereo silence, and package into MPEG-TS
+        // NOTE: shaka-packager does NOT populate width/height in the fMP4 moov box
+        // ("pixel width/height are not set"). Any ffmpeg filter that needs input dimensions
+        // at init time (scale, format) will hang indefinitely waiting for valid dimension data.
+        // ONLY use filters that are dimension-agnostic at init time (settb, setpts).
+        // VideoToolbox handles the 10-bit yuv420p10le → 8-bit yuv420p conversion internally.
+        ffmpegProc = spawn('ffmpeg', [
+          '-y',
+          '-i', pipeOut,
+          '-f', 'lavfi',
+          '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+          '-vf', 'settb=AVTB,setpts=PTS-STARTPTS',
+          '-c:v', 'h264_videotoolbox',
+          '-pix_fmt', 'yuv420p',
+          '-b:v', '6000k',
+          '-color_primaries', 'bt709',
+          '-color_trc', 'bt709',
+          '-colorspace', 'bt709',
+          '-c:a', 'aac',
+          '-shortest',
+          '-f', 'mpegts',
+          'pipe:1'
+        ]);
+        castManager.registerProxyProc(ffmpegProc);
+
+        res.setHeader('Content-Type', 'video/mp2t');
+        ffmpegProc.stdout.pipe(res);
+      } else {
+        castManager.appendLog('System', `Stream Proxy: Piping raw decrypted fMP4 stream`);
+        if (url.includes('m3u8')) {
+          res.setHeader('Content-Type', 'video/mp2t');
+        } else {
+          res.setHeader('Content-Type', 'video/mp4');
+        }
+        const pipeOutStream = fs.createReadStream(pipeOut);
+        pipeOutStream.on('error', (err) => {
+          castManager.appendLog('System', `pipeOutStream error: ${err.message}`);
+          cleanup();
+        });
+        pipeOutStream.pipe(res);
       }
-    });
-  } catch (err) {
-    castManager.appendLog('System-Error', `Failed to start stream proxy: ${err.message}`);
-    if (!res.headersSent) {
-      res.status(500).send(`Failed to start stream proxy: ${err.message}`);
+
+      shakaProc.stdout.on('data', (data) => castManager.appendLog('shaka-packager', data));
+      shakaProc.stderr.on('data', (data) => castManager.appendLog('shaka-packager-err', data));
+      ytdlpProc.stderr.on('data', (data) => castManager.appendLog('yt-dlp-proxy', data));
+
+      ytdlpProc.on('exit', (code, signal) => {
+        castManager.appendLog('yt-dlp-proxy', `Process exited with code ${code} and signal ${signal}`);
+      });
+
+      shakaProc.on('exit', (code, signal) => {
+        castManager.appendLog('shaka-packager', `Process exited with code ${code} and signal ${signal}`);
+      });
+
+      req.on('close', () => {
+        cleanup();
+      });
+
+      ytdlpProc.on('error', (err) => {
+        castManager.appendLog('yt-dlp-proxy-error', err.message);
+        cleanup();
+        if (!res.headersSent) {
+          res.status(500).send(`Streaming error: ${err.message}`);
+        }
+      });
+
+      shakaProc.on('error', (err) => {
+        castManager.appendLog('shaka-packager-error', err.message);
+        cleanup();
+        if (!res.headersSent) {
+          res.status(500).send(`Decryption error: ${err.message}`);
+        }
+      });
+
+      if (ffmpegProc) {
+        ffmpegProc.stderr.on('data', (data) => castManager.appendLog('ffmpeg-transmux', data));
+        ffmpegProc.on('exit', (code, signal) => {
+          castManager.appendLog('ffmpeg-transmux', `Process exited with code ${code} and signal ${signal}`);
+        });
+        ffmpegProc.on('error', (err) => {
+          castManager.appendLog('ffmpeg-transmux-error', err.message);
+          cleanup();
+          if (!res.headersSent) {
+            res.status(500).send(`Transmuxing error: ${err.message}`);
+          }
+        });
+      }
+
+    } catch (err) {
+      castManager.appendLog('System-Error', `Failed to start decrypted stream proxy: ${err.message}`);
+      if (tempDir && fs.existsSync(tempDir)) {
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (e) {}
+      }
+      if (!res.headersSent) {
+        res.status(500).send(`Failed to start decrypted stream proxy: ${err.message}`);
+      }
+    }
+  } else {
+    castManager.appendLog('System', `Stream Proxy: Spawning yt-dlp for ${url} with headers: ${headerKeys.join(', ') || 'none'}`);
+
+    try {
+      const ytdlpProc = spawn('yt-dlp', ytdlpArgs);
+      castManager.registerProxyProc(ytdlpProc);
+
+      if (url.includes('m3u8')) {
+        res.setHeader('Content-Type', 'video/mp2t');
+      } else {
+        res.setHeader('Content-Type', 'video/mp4');
+      }
+
+      // Pipe yt-dlp stdout directly to Express response
+      ytdlpProc.stdout.pipe(res);
+
+      // Capture stderr logs
+      ytdlpProc.stderr.on('data', (data) => {
+        castManager.appendLog('yt-dlp-proxy', data);
+      });
+
+      // Handle process exits
+      ytdlpProc.on('exit', (code, signal) => {
+        castManager.appendLog('yt-dlp-proxy', `Process exited with code ${code} and signal ${signal}`);
+      });
+
+      // Handle connection close (Apple TV disconnects or stops playing)
+      req.on('close', () => {
+        castManager.appendLog('System', `Stream Proxy: Client disconnected. Killing proxy yt-dlp process.`);
+        ytdlpProc.kill('SIGKILL');
+      });
+
+      ytdlpProc.on('error', (err) => {
+        castManager.appendLog('yt-dlp-proxy-error', err.message);
+        if (!res.headersSent) {
+          res.status(500).send(`Streaming error: ${err.message}`);
+        }
+      });
+    } catch (err) {
+      castManager.appendLog('System-Error', `Failed to start stream proxy: ${err.message}`);
+      if (!res.headersSent) {
+        res.status(500).send(`Failed to start stream proxy: ${err.message}`);
+      }
     }
   }
 });
@@ -410,7 +661,7 @@ app.get('/api/history', async (_req, res) => {
 
 // POST: Add a new preset
 app.post('/api/history', async (req, res) => {
-  const { name, url, headers } = req.body;
+  const { name, url, headers, keys } = req.body;
 
   if (!name || !url) {
     return res.status(400).json({ success: false, error: 'Name and URL are required.' });
@@ -424,8 +675,12 @@ app.post('/api/history', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Name or URL exceeds maximum length.' });
   }
 
+  if (keys !== undefined && !Array.isArray(keys)) {
+    return res.status(400).json({ success: false, error: 'Keys must be an array.' });
+  }
+
   try {
-    const item = await historyStore.add({ name, url, headers });
+    const item = await historyStore.add({ name, url, headers, keys });
     res.status(201).json(item);
   } catch (err) {
     console.error('Failed to add history:', err);
@@ -436,7 +691,7 @@ app.post('/api/history', async (req, res) => {
 // PUT: Update an existing preset
 app.put('/api/history/:id', async (req, res) => {
   const { id } = req.params;
-  const { name, url, headers } = req.body;
+  const { name, url, headers, keys } = req.body;
 
   if (name !== undefined && typeof name !== 'string') {
     return res.status(400).json({ success: false, error: 'Name must be a string.' });
@@ -444,9 +699,12 @@ app.put('/api/history/:id', async (req, res) => {
   if (url !== undefined && typeof url !== 'string') {
     return res.status(400).json({ success: false, error: 'URL must be a string.' });
   }
+  if (keys !== undefined && !Array.isArray(keys)) {
+    return res.status(400).json({ success: false, error: 'Keys must be an array.' });
+  }
 
   try {
-    const updated = await historyStore.update(id, { name, url, headers });
+    const updated = await historyStore.update(id, { name, url, headers, keys });
     if (!updated) {
       return res.status(404).json({ success: false, error: 'History item not found.' });
     }

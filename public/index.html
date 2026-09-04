@@ -38,6 +38,10 @@
         <span class="status-dot"></span>
         <span>pyatv</span>
       </div>
+      <div class="dep-badge" id="dep-shakapackager" title="shaka-packager decryption tool">
+        <span class="status-dot"></span>
+        <span>shaka-packager</span>
+      </div>
       <div class="dep-badge" id="dep-vlc" title="VLC App in Applications folder">
         <span class="status-dot"></span>
         <span>VLC Player</span>
@@ -85,6 +89,21 @@
           </div>
         </div>
 
+        <!-- DRM Keys Manager -->
+        <div class="form-group mt-1">
+          <div class="headers-manager">
+            <div class="headers-title-row">
+              <label><i data-lucide="key-round"></i> ClearKey DRM Keys (KID:Key)</label>
+              <button type="button" class="btn-secondary-sm" id="btn-add-key">
+                <i data-lucide="plus" class="icon-sm"></i> Add Key
+              </button>
+            </div>
+            <div class="headers-list" id="keys-list">
+              <!-- Key rows dynamically added -->
+            </div>
+          </div>
+        </div>
+
         <!-- Save checkbox -->
         <div class="form-group checkbox-row">
           <input type="checkbox" id="save-preset-checkbox" class="mr-025 w-auto">
@@ -125,6 +144,32 @@
           <label>Active URL</label>
           <input type="text" id="active-url-display" readonly class="url-display" value="-">
         </div>
+
+        <!-- Volume Control Panel -->
+        <div class="volume-control-panel mt-1 disabled" id="volume-control-panel">
+          <div class="volume-header">
+            <label><i data-lucide="volume-2" id="volume-header-icon"></i> Device Volume</label>
+            <span class="volume-badge" id="volume-value-label">50%</span>
+          </div>
+          <div class="volume-controls-row">
+            <button type="button" class="btn-volume-btn btn-volume-mute" id="btn-volume-mute" title="Mute / Unmute" disabled>
+              <i data-lucide="volume-2" id="volume-mute-icon"></i>
+            </button>
+            <button type="button" class="btn-volume-btn btn-volume-step" id="btn-volume-down" title="Decrease volume (-5%)" disabled>
+              <i data-lucide="minus"></i>
+            </button>
+            <div class="volume-slider-wrapper">
+              <input type="range" id="volume-slider" min="0" max="100" value="50" step="1" disabled class="volume-slider">
+            </div>
+            <button type="button" class="btn-volume-btn btn-volume-step" id="btn-volume-up" title="Increase volume (+5%)" disabled>
+              <i data-lucide="plus"></i>
+            </button>
+          </div>
+          <div class="volume-hint" id="volume-hint">
+            <i data-lucide="info"></i>
+            <span>If TV displays <em>"Use your remote control to change the volume"</em>, open Chromecast <strong>Settings &rarr; Remotes &amp; Accessories &rarr; Set up remote buttons &rarr; Volume control</strong> and select <strong>Chromecast</strong>.</span>
+          </div>
+        </div>
       </section>
 
       <!-- Video Player Preview Card -->
@@ -162,6 +207,9 @@
         <div class="terminal-controls">
           <button type="button" class="btn-secondary-sm" id="btn-clear-logs">
             <i data-lucide="trash-2" class="icon-sm"></i> Clear Logs
+          </button>
+          <button type="button" class="btn-secondary-sm" id="btn-copy-logs">
+            <i data-lucide="clipboard-copy" class="icon-sm"></i> Copy Logs
           </button>
           <button type="button" class="btn-secondary-sm btn-auto-scroll" id="btn-toggle-autoscroll">
             <i data-lucide="check" class="icon-sm"></i> Auto Scroll
@@ -210,6 +258,21 @@
             </div>
             <div class="headers-list" id="modal-headers-list">
               <!-- Preset Header rows -->
+            </div>
+          </div>
+        </div>
+
+        <!-- DRM Keys inside Modal -->
+        <div class="form-group mt-1">
+          <div class="headers-manager">
+            <div class="headers-title-row">
+              <label>Preset DRM Keys</label>
+              <button type="button" class="btn-secondary-sm" id="btn-modal-add-key">
+                <i data-lucide="plus" class="icon-sm"></i> Add
+              </button>
+            </div>
+            <div class="headers-list" id="modal-keys-list">
+              <!-- Preset Key rows -->
             </div>
           </div>
         </div>

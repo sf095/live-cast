@@ -15,6 +15,9 @@ const state = {
   autoScroll: true,
   pollTimer: null,
   isScanning: false,
+  volume: 50,
+  isMuted: false,
+  isVolumeChanging: false,
 };
 
 // ── DOM References ────────────────────────────────────────────────────────────
@@ -24,6 +27,7 @@ const el = {
     ytdlp: document.getElementById('dep-ytdlp'),
     catt: document.getElementById('dep-catt'),
     atvremote: document.getElementById('dep-atvremote'),
+    shakapackager: document.getElementById('dep-shakapackager'),
     vlc: document.getElementById('dep-vlc'),
   },
 
@@ -34,6 +38,8 @@ const el = {
     streamUrl: document.getElementById('stream-url'),
     headersList: document.getElementById('headers-list'),
     btnAddHeader: document.getElementById('btn-add-header'),
+    keysList: document.getElementById('keys-list'),
+    btnAddKey: document.getElementById('btn-add-key'),
     savePresetCheckbox: document.getElementById('save-preset-checkbox'),
     btnCast: document.getElementById('btn-cast'),
     btnStop: document.getElementById('btn-stop'),
@@ -45,6 +51,16 @@ const el = {
     activeUrl: document.getElementById('active-url-display'),
   },
 
+  volume: {
+    panel: document.getElementById('volume-control-panel'),
+    slider: document.getElementById('volume-slider'),
+    btnMute: document.getElementById('btn-volume-mute'),
+    muteIcon: document.getElementById('volume-mute-icon'),
+    btnDown: document.getElementById('btn-volume-down'),
+    btnUp: document.getElementById('btn-volume-up'),
+    label: document.getElementById('volume-value-label'),
+  },
+
   history: {
     list: document.getElementById('history-list'),
     btnCreate: document.getElementById('btn-create-preset'),
@@ -53,6 +69,7 @@ const el = {
   terminal: {
     body: document.getElementById('terminal-body'),
     btnClear: document.getElementById('btn-clear-logs'),
+    btnCopy: document.getElementById('btn-copy-logs'),
     btnAutoscroll: document.getElementById('btn-toggle-autoscroll'),
   },
 
@@ -65,6 +82,8 @@ const el = {
     urlInput: document.getElementById('preset-url'),
     headersList: document.getElementById('modal-headers-list'),
     btnAddHeader: document.getElementById('btn-modal-add-header'),
+    keysList: document.getElementById('modal-keys-list'),
+    btnAddKey: document.getElementById('btn-modal-add-key'),
     btnClose: document.getElementById('btn-close-modal'),
     btnCancel: document.getElementById('btn-cancel-modal'),
   },
@@ -136,6 +155,7 @@ async function checkSystemStatus() {
     updateBadge(el.deps.ytdlp, status.ytdlp);
     updateBadge(el.deps.catt, status.catt);
     updateBadge(el.deps.atvremote, status.atvremote);
+    updateBadge(el.deps.shakapackager, status.shakapackager);
     updateBadge(el.deps.vlc, status.vlc);
   } catch (err) {
     console.error('Failed to get system dependency status:', err);
@@ -262,6 +282,54 @@ function renderHeaders(container, headersObj) {
   Object.entries(headersObj).forEach(([key, val]) => addHeaderRow(container, key, val));
 }
 
+function addKeyRow(container, kid = '', key = '') {
+  const row = document.createElement('div');
+  row.className = 'header-row';
+
+  const kidInput = document.createElement('input');
+  kidInput.type = 'text';
+  kidInput.placeholder = 'Key ID (KID) e.g. eb1e6c51...';
+  kidInput.value = kid;
+  kidInput.required = true;
+
+  const keyInput = document.createElement('input');
+  keyInput.type = 'text';
+  keyInput.placeholder = 'DRM Key e.g. 1b278aee...';
+  keyInput.value = key;
+  keyInput.required = true;
+
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'btn-icon';
+  removeBtn.setAttribute('aria-label', 'Remove DRM key');
+  removeBtn.innerHTML = '<i data-lucide="trash-2" style="width: 16px; height: 16px;"></i>';
+  removeBtn.addEventListener('click', () => row.remove());
+
+  row.appendChild(kidInput);
+  row.appendChild(keyInput);
+  row.appendChild(removeBtn);
+
+  container.appendChild(row);
+  refreshIcons(container);
+}
+
+function serializeKeys(container) {
+  const keys = [];
+  container.querySelectorAll('.header-row').forEach((row) => {
+    const inputs = row.querySelectorAll('input');
+    const kid = inputs[0].value.trim();
+    const key = inputs[1].value.trim();
+    if (kid && key) keys.push({ kid, key });
+  });
+  return keys;
+}
+
+function renderKeys(container, keysArr) {
+  container.innerHTML = '';
+  if (!keysArr || !Array.isArray(keysArr)) return;
+  keysArr.forEach(({ kid, key }) => addKeyRow(container, kid, key));
+}
+
 // ── Casting Controls ──────────────────────────────────────────────────────────
 
 async function handleCastStart() {
@@ -288,6 +356,7 @@ async function handleCastStart() {
     return;
   }
   const headers = serializeHeaders(el.controls.headersList);
+  const keys = serializeKeys(el.controls.keysList);
 
   el.controls.btnCast.disabled = true;
   el.controls.btnCast.innerHTML = '<span class="spinner"></span> Casting...';
@@ -296,7 +365,7 @@ async function handleCastStart() {
     const res = await fetch('/api/cast', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, ip, deviceType, deviceId, headers }),
+      body: JSON.stringify({ url, ip, deviceType, deviceId, headers, keys }),
     });
     const data = await res.json();
 
@@ -304,10 +373,11 @@ async function handleCastStart() {
       state.castStatus = 'casting';
       state.logCount = 0;
       el.controls.btnStop.disabled = false;
+      setVolumeControlsEnabled(true);
       startStatusPolling();
 
       if (el.controls.savePresetCheckbox.checked) {
-        saveUrlToHistory(url, headers);
+        saveUrlToHistory(url, headers, keys);
       }
     } else {
       appendErrorLog(`Casting failed to start: ${data.error}`);
@@ -341,6 +411,7 @@ function resetCastButtons() {
   el.controls.btnCast.innerHTML = '<i data-lucide="play-circle"></i> Start Cast';
   el.controls.btnStop.disabled = true;
   refreshIcons(el.controls.btnCast);
+  setVolumeControlsEnabled(false);
 }
 
 // ── Status Polling (only while casting) ───────────────────────────────────────
@@ -376,7 +447,7 @@ function stopStatusPolling() {
 let hlsInstance = null;
 let activePlayerUrl = null;
 
-async function updatePlayerPreview(url, headers) {
+async function updatePlayerPreview(url, headers, keys) {
   const playerCard = document.getElementById('player-card');
   const video = document.getElementById('preview-player');
   if (!playerCard || !video) return;
@@ -403,7 +474,7 @@ async function updatePlayerPreview(url, headers) {
     const tokenRes = await fetch('/api/headers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ headers: headers || {} }),
+      body: JSON.stringify({ headers: headers || {}, keys: keys || [] }),
     });
     const tokenData = await tokenRes.json();
     if (tokenData.success) {
@@ -470,16 +541,86 @@ function updateSessionStatusUI(session) {
     }
 
     // Trigger local player preview
-    updatePlayerPreview(session.url, session.headers);
+    updatePlayerPreview(session.url, session.headers, session.keys);
+
+    // Enable volume controls and sync state if not actively dragging
+    setVolumeControlsEnabled(true);
+    if (session.volume !== undefined && !state.isVolumeChanging) {
+      updateVolumeUI(session.volume, session.isMuted);
+    }
   } else {
     resetCastButtons();
     updatePlayerPreview(null);
+    setVolumeControlsEnabled(false);
   }
 
   // Render new log lines (server already returns only new ones)
   if (session.logs && session.logs.length > 0) {
     state.logCount = session.logCount || (state.logCount + session.logs.length);
     appendLogsToTerminal(session.logs);
+  }
+}
+
+// ── Volume Controls ──────────────────────────────────────────────────────────
+
+function debounce(func, wait) {
+  let timeout;
+  return function (...args) {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func.apply(this, args), wait);
+  };
+}
+
+function setVolumeControlsEnabled(enabled) {
+  if (!el.volume || !el.volume.panel) return;
+  el.volume.panel.classList.toggle('disabled', !enabled);
+  if (el.volume.slider) el.volume.slider.disabled = !enabled;
+  if (el.volume.btnMute) el.volume.btnMute.disabled = !enabled;
+  if (el.volume.btnDown) el.volume.btnDown.disabled = !enabled;
+  if (el.volume.btnUp) el.volume.btnUp.disabled = !enabled;
+}
+
+function updateVolumeUI(level, isMuted) {
+  state.volume = level;
+  state.isMuted = Boolean(isMuted);
+
+  if (el.volume.slider && document.activeElement !== el.volume.slider) {
+    el.volume.slider.value = level;
+  }
+  if (el.volume.label) {
+    el.volume.label.textContent = `${level}%`;
+  }
+  if (el.volume.btnMute && el.volume.muteIcon) {
+    el.volume.btnMute.classList.toggle('is-muted', state.isMuted);
+    const iconName = state.isMuted ? 'volume-x' : (level > 50 ? 'volume-2' : (level > 0 ? 'volume-1' : 'volume-x'));
+    el.volume.muteIcon.setAttribute('data-lucide', iconName);
+    refreshIcons(el.volume.btnMute);
+  }
+}
+
+async function sendVolumeCommand(payload) {
+  try {
+    state.isVolumeChanging = true;
+    const res = await fetch('/api/cast/volume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (data.success) {
+      updateVolumeUI(data.level, data.isMuted);
+    } else {
+      showToast(`Volume error: ${data.error}`, 'error');
+      updateVolumeUI(state.volume, state.isMuted);
+    }
+  } catch (err) {
+    console.error('Failed to change volume:', err);
+    showToast('Failed to change volume.', 'error');
+    updateVolumeUI(state.volume, state.isMuted);
+  } finally {
+    setTimeout(() => {
+      state.isVolumeChanging = false;
+    }, 300);
   }
 }
 
@@ -521,6 +662,23 @@ function appendErrorLog(message) {
 function clearTerminal() {
   el.terminal.body.innerHTML = '<div class="log-line log-system">[System] Console cleared.</div>';
   state.logCount = 0;
+}
+
+function copyLogs() {
+  const lines = el.terminal.body.querySelectorAll('.log-line');
+  const text = Array.from(lines).map(l => l.textContent).join('\n');
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = el.terminal.btnCopy;
+    const original = btn.innerHTML;
+    btn.innerHTML = '<i data-lucide="check" class="icon-sm"></i> Copied!';
+    lucide.createIcons();
+    setTimeout(() => {
+      btn.innerHTML = original;
+      lucide.createIcons();
+    }, 2000);
+  }).catch(() => {
+    alert('Failed to copy logs to clipboard.');
+  });
 }
 
 function toggleAutoscroll() {
@@ -586,6 +744,7 @@ function renderHistoryList() {
     playBtn.addEventListener('click', () => {
       el.controls.streamUrl.value = item.url;
       renderHeaders(el.controls.headersList, item.headers);
+      renderKeys(el.controls.keysList, item.keys);
       el.controls.savePresetCheckbox.checked = false;
       el.controls.streamUrl.scrollIntoView({ behavior: 'smooth' });
       if (el.controls.deviceSelect.value) {
@@ -625,7 +784,7 @@ function renderHistoryList() {
   refreshIcons(el.history.list);
 }
 
-async function saveUrlToHistory(url, headers) {
+async function saveUrlToHistory(url, headers, keys) {
   if (state.history.some((item) => item.url === url)) {
     showToast('URL already exists in presets.', 'info');
     return;
@@ -636,7 +795,7 @@ async function saveUrlToHistory(url, headers) {
     const res = await fetch('/api/history', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, url, headers }),
+      body: JSON.stringify({ name, url, headers, keys }),
     });
     if (res.ok) {
       await fetchHistory();
@@ -655,12 +814,14 @@ function openPresetModal(item = null) {
     el.modal.nameInput.value = item.name;
     el.modal.urlInput.value = item.url;
     renderHeaders(el.modal.headersList, item.headers);
+    renderKeys(el.modal.keysList, item.keys);
   } else {
     el.modal.title.textContent = 'Add Stream Preset';
     el.modal.idInput.value = '';
     el.modal.nameInput.value = '';
     el.modal.urlInput.value = '';
     el.modal.headersList.innerHTML = '';
+    el.modal.keysList.innerHTML = '';
   }
   el.modal.overlay.classList.add('open');
 }
@@ -674,6 +835,7 @@ async function savePreset() {
   const name = el.modal.nameInput.value.trim();
   const url = el.modal.urlInput.value.trim();
   const headers = serializeHeaders(el.modal.headersList);
+  const keys = serializeKeys(el.modal.keysList);
 
   try {
     let res;
@@ -681,13 +843,13 @@ async function savePreset() {
       res = await fetch(`/api/history/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, url, headers }),
+        body: JSON.stringify({ name, url, headers, keys }),
       });
     } else {
       res = await fetch('/api/history', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, url, headers }),
+        body: JSON.stringify({ name, url, headers, keys }),
       });
     }
 
@@ -735,10 +897,59 @@ document.addEventListener('DOMContentLoaded', () => {
   el.controls.btnScan.addEventListener('click', scanDevices);
   el.controls.btnAddHeader.addEventListener('click', () => addHeaderRow(el.controls.headersList));
   el.modal.btnAddHeader.addEventListener('click', () => addHeaderRow(el.modal.headersList));
+  el.controls.btnAddKey.addEventListener('click', () => addKeyRow(el.controls.keysList));
+  el.modal.btnAddKey.addEventListener('click', () => addKeyRow(el.modal.keysList));
   el.controls.btnCast.addEventListener('click', handleCastStart);
   el.controls.btnStop.addEventListener('click', handleCastStop);
   el.terminal.btnClear.addEventListener('click', clearTerminal);
+  el.terminal.btnCopy.addEventListener('click', copyLogs);
   el.terminal.btnAutoscroll.addEventListener('click', toggleAutoscroll);
+
+  // Volume event listeners
+  if (el.volume.slider) {
+    const debouncedSetVolume = debounce((val) => {
+      sendVolumeCommand({ action: 'set', level: val });
+    }, 200);
+
+    el.volume.slider.addEventListener('input', (e) => {
+      const val = parseInt(e.target.value, 10);
+      if (el.volume.label) {
+        el.volume.label.textContent = `${val}%`;
+      }
+      state.volume = val;
+      state.isMuted = val === 0;
+      if (el.volume.btnMute && el.volume.muteIcon) {
+        el.volume.btnMute.classList.toggle('is-muted', state.isMuted);
+        const iconName = state.isMuted ? 'volume-x' : (val > 50 ? 'volume-2' : (val > 0 ? 'volume-1' : 'volume-x'));
+        el.volume.muteIcon.setAttribute('data-lucide', iconName);
+        refreshIcons(el.volume.btnMute);
+      }
+      debouncedSetVolume(val);
+    });
+  }
+
+  if (el.volume.btnDown) {
+    el.volume.btnDown.addEventListener('click', () => {
+      const nextVal = Math.max(0, state.volume - 5);
+      updateVolumeUI(nextVal, nextVal === 0);
+      sendVolumeCommand({ action: 'down', step: 5 });
+    });
+  }
+
+  if (el.volume.btnUp) {
+    el.volume.btnUp.addEventListener('click', () => {
+      const nextVal = Math.min(100, state.volume + 5);
+      updateVolumeUI(nextVal, false);
+      sendVolumeCommand({ action: 'up', step: 5 });
+    });
+  }
+
+  if (el.volume.btnMute) {
+    el.volume.btnMute.addEventListener('click', () => {
+      const targetMute = !state.isMuted;
+      sendVolumeCommand({ action: 'mute', isMuted: targetMute });
+    });
+  }
 
   // Modal events
   el.history.btnCreate.addEventListener('click', () => openPresetModal());

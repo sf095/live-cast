@@ -83,13 +83,14 @@ async function getAll() {
 /**
  * Add a new history item.
  */
-async function add({ name, url, headers }) {
+async function add({ name, url, headers, keys }) {
   await loadCache();
   const item = {
     id: generateId(),
     name,
     url,
     headers: headers || {},
+    keys: keys || [],
     createdAt: new Date().toISOString(),
   };
   cache.push(item);
@@ -100,7 +101,7 @@ async function add({ name, url, headers }) {
 /**
  * Update an existing history item by ID.
  */
-async function update(id, { name, url, headers }) {
+async function update(id, { name, url, headers, keys }) {
   await loadCache();
   const index = cache.findIndex((item) => item.id === id);
   if (index === -1) return null;
@@ -110,6 +111,7 @@ async function update(id, { name, url, headers }) {
     name: name || cache[index].name,
     url: url || cache[index].url,
     headers: headers || cache[index].headers,
+    keys: keys || cache[index].keys || [],
     updatedAt: new Date().toISOString(),
   };
 
